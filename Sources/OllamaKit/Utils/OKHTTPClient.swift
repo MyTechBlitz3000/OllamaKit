@@ -90,81 +90,41 @@ internal extension OKHTTPClient {
 }
 
 // MARK: - Combine API
-internal extension OKHTTPClient {
+func stream<T: Decodable>(
+    request: URLRequest,
+    with responseType: T.Type
+) -> AnyPublisher<T, Error> {
 
-    func send<T: Decodable>(
-        request: URLRequest,
-        with responseType: T.Type
-    ) -> AnyPublisher<T, Error> {
-        URLSession.shared.dataTaskPublisher(for: request)
-            .tryMap { data, response in
-                try self.validate(response: response)
-                return data
-            }
-            .decode(type: T.self, decoder: decoder)
-            .receive(on: DispatchQueue.main)
-            .eraseToAnyPublisher()
-    }
+    let delegate = StreamingDelegate()
+    let session = URLSession(configuration: .default,
+                             delegate: delegate,
+                             delegateQueue: .main)
 
-    func send(request: URLRequest) -> AnyPublisher<Void, Error> {
-        URLSession.shared.dataTaskPublisher(for: request)
-            .tryMap { _, response in
-                try self.validate(response: response)
-                return ()
-            }
-            .receive(on: DispatchQueue.main)
-            .eraseToAnyPublisher()
-    }
+    session.dataTask(with: request).resume()
 
-    func stream<T: Decodable>(
-        request: URLRequest,
-        with responseType: T.Type
-    ) -> AnyPublisher<T, Error> {
+    let bufferActor = BufferActor()
 
-        let delegate = StreamingDelegate()
-        let session = URLSession(configuration: .default,
-                                 delegate: delegate,
-                                 delegateQueue: .main)
+    return delegate.publisher()
+        .flatMap { newData -> AnyPublisher<T, Error> in
+            Future { promise in
+                Task {
+                    for byte in newData {
+                        await bufferActor.append(byte)
+                    }
 
-        let task = session.dataTask(with: request)
-        task.resume()
-
-        let bufferActor = BufferActor()
-
-        return delegate.publisher()
-            .flatMap { newData -> AnyPublisher<T, Error> in
-                Future { promise in
-                    Task {
-                        for byte in newData {
-                            await bufferActor.append(byte)
+                    if let chunk = await bufferActor.extractNextJSON(self.extractNextJSON) {
+                        do {
+                            let decoded = try self.decoder.decode(T.self, from: chunk)
+                            promise(.success(decoded))
+                        } catch {
+                            promise(.failure(error))
                         }
-
-                        var results: [T] = []
-
-                        while true {
-                            guard let chunk = await bufferActor.extractNextJSON(self.extractNextJSON) else {
-                                break
-                            }
-
-                            do {
-                                let decoded = try self.decoder.decode(T.self, from: chunk)
-                                results.append(decoded)
-                            } catch {
-                                print("Decoding error:", error)
-                            }
-                        }
-
-                        promise(.success(results))
                     }
                 }
-                .flatMap { items in
-                    Publishers.Sequence(sequence: items)
-                        .setFailureType(to: Error.self)
-                }
-                .eraseToAnyPublisher()
             }
             .eraseToAnyPublisher()
-    }
+        }
+        .eraseToAnyPublisher()
 }
 
 // MARK: - Core helpers
