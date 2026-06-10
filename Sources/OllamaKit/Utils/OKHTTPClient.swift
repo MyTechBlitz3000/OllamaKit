@@ -18,9 +18,9 @@ actor BufferActor {
 
         // Using byte literals avoids high-overhead Character conversions
         let backslash: UInt8 = 0x5C // "\\"
-        let quote: UInt8     = 0x22 // "\""
+        let quote: UInt8 = 0x22 // "\""
         let openBrace: UInt8 = 0x7B // "{"
-        let closeBrace: UInt8= 0x7D // "}"
+        let closeBrace: UInt8 = 0x7D // "}"
 
         for idx in buffer.indices {
             let byte = buffer[idx]
