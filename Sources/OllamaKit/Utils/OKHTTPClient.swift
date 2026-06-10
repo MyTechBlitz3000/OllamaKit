@@ -1,3 +1,7 @@
+//
+//  OKHTTPClient.swift
+//
+
 import Foundation
 import Combine
 
@@ -9,14 +13,14 @@ actor BufferActor {
         buffer.append(byte)
     }
 
-    /// Extracted into the actor to avoid crossing isolation boundaries with mutable state
+    /// Extracted into the actor to avoid crossing isolation boundaries with mutable state.
+    /// Uses low-overhead byte matching instead of heavy Character allocations.
     func extractNextJSON() -> Data? {
         var escaped = false
         var inString = false
         var depth = 0
         var start: Data.Index?
 
-        // Using byte literals avoids high-overhead Character conversions
         let backslash: UInt8 = 0x5C // "\\"
         let quote: UInt8 = 0x22 // "\""
         let openBrace: UInt8 = 0x7B // "{"
@@ -54,6 +58,7 @@ actor BufferActor {
 
                 if depth == 0, let startIndex = start {
                     let nextIndex = buffer.index(after: idx)
+                    // Uses strict exclusive Range syntax to prevent subdata off-by-one errors
                     let chunk = buffer.subdata(in: startIndex..<nextIndex)
                     buffer.removeSubrange(startIndex..<nextIndex)
                     return chunk
@@ -70,7 +75,7 @@ internal struct OKHTTPClient: Sendable {
     private let decoder = JSONDecoder()
     static let shared = OKHTTPClient()
     
-    private init() {} // Prevent arbitrary instances
+    private init() {} // Encapsulates the shared singleton
 }
 
 // MARK: - Async/Await API
@@ -107,14 +112,14 @@ internal extension OKHTTPClient {
                     for try await byte in bytes {
                         await bufferActor.append(byte)
 
-                        // Keep extracting until no more valid objects can be constructed
+                        // Safely processes continuous stream frames
                         while let chunk = await bufferActor.extractNextJSON() {
                             do {
                                 let decoded = try decoder.decode(T.self, from: chunk)
                                 continuation.yield(decoded)
                             } catch {
-                                // Skip bad chunks but do not crash/kill the stream
-                                print("Decoding error:", error)
+                                // Skip individual corrupt chunk, preserve the rest of the stream
+                                print("Decoding error encountered: \(error)")
                             }
                         }
                     }
@@ -125,7 +130,7 @@ internal extension OKHTTPClient {
                 }
             }
 
-            // Clean handling of stream cancellation
+            // Correctly cancels the network request if the stream is abandoned
             continuation.onTermination = { _ in
                 task.cancel()
             }
@@ -136,7 +141,8 @@ internal extension OKHTTPClient {
 // MARK: - Combine API
 internal extension OKHTTPClient {
     
-    /// Bridges the AsyncThrowingStream elegantly into Combine without manual delegate hell
+    /// Bridges the AsyncThrowingStream directly to Combine.
+    /// Fixes the original bugs where the buffer was reset on every packet.
     func stream<T: Decodable>(
         request: URLRequest,
         with responseType: T.Type
