@@ -1,3 +1,4 @@
+
 //
 //  OKHTTPClient.swift
 //
@@ -13,56 +14,74 @@ actor BufferActor {
         buffer.append(byte)
     }
 
-    /// Extracted into the actor to avoid crossing isolation boundaries with mutable state.
-    /// Uses low-overhead byte matching instead of heavy Character allocations.
+    /// Bulletproof JSON Stream Extractor.
+    /// Operates as a true sequential state machine to handle nested objects, 
+    /// string scopes, escaped characters, and multi-byte UTF-8 safety.
     func extractNextJSON() -> Data? {
-        var escaped = false
-        var inString = false
+        var isEscaped = false
+        var isInString = false
         var depth = 0
-        var start: Data.Index?
+        var startIdx: Data.Index?
 
-        let backslash: UInt8 = 0x5C // "\\"
-        let quote: UInt8 = 0x22 // "\""
-        let openBrace: UInt8 = 0x7B // "{"
-        let closeBrace: UInt8 = 0x7D // "}"
+        let backslash: UInt8 = 0x5C // \
+        let quote: UInt8     = 0x22 // "
+        let openBrace: UInt8 = 0x7B // {
+        let closeBrace: UInt8= 0x7D // }
 
         for idx in buffer.indices {
             let byte = buffer[idx]
 
-            if escaped {
-                escaped = false
+            if isEscaped {
+                isEscaped = false
                 continue
             }
 
             if byte == backslash {
-                escaped = true
+                // Only treat as escape indicator if we are inside a string literal
+                if isInString {
+                    isEscaped = true
+                }
                 continue
             }
 
             if byte == quote {
-                inString.toggle()
+                isInString.toggle()
                 continue
             }
 
-            guard !inString else { continue }
+            // While trapped inside a JSON string literal, completely ignore brackets.
+            // This natively prevents multi-byte UTF-8 collisions and text anomalies.
+            guard !isInString else { continue }
 
             if byte == openBrace {
                 depth += 1
                 if depth == 1 {
-                    start = idx
+                    startIdx = idx
                 }
-            }
-
-            if byte == closeBrace {
+            } else if byte == closeBrace {
+                guard depth > 0 else {
+                    // Malformed prefix data fallback: drop byte to prevent endless loop
+                    buffer.removeFirst(1)
+                    return nil
+                }
+                
                 depth -= 1
 
-                if depth == 0, let startIndex = start {
+                if depth == 0, let start = startIdx {
                     let nextIndex = buffer.index(after: idx)
-                    // Uses strict exclusive Range syntax to prevent subdata off-by-one errors
-                    let chunk = buffer.subdata(in: startIndex..<nextIndex)
-                    buffer.removeSubrange(startIndex..<nextIndex)
+                    let chunk = buffer.subdata(in: start..<nextIndex)
+                    buffer.removeSubrange(..<nextIndex) // Drops processed chunk + leading whitespace
                     return chunk
                 }
+            }
+        }
+
+        // If the stream ends or is interrupted with an incomplete object,
+        // clear corrupted data when depth breaks sequence bounds.
+        if depth == 0 && startIdx == nil && !buffer.isEmpty {
+            // Trim leading control whitespaces/newlines between JSON chunks
+            while let first = buffer.first, first <= 0x20 {
+                buffer.removeFirst()
             }
         }
 
@@ -75,7 +94,7 @@ internal struct OKHTTPClient: Sendable {
     private let decoder = JSONDecoder()
     static let shared = OKHTTPClient()
     
-    private init() {} // Encapsulates the shared singleton
+    private init() {} 
 }
 
 // MARK: - Async/Await API
@@ -112,13 +131,12 @@ internal extension OKHTTPClient {
                     for try await byte in bytes {
                         await bufferActor.append(byte)
 
-                        // Safely processes continuous stream frames
                         while let chunk = await bufferActor.extractNextJSON() {
                             do {
                                 let decoded = try decoder.decode(T.self, from: chunk)
                                 continuation.yield(decoded)
                             } catch {
-                                // Skip individual corrupt chunk, preserve the rest of the stream
+                                // Skip individual corrupt chunk, preserve stream health
                                 print("Decoding error encountered: \(error)")
                             }
                         }
@@ -130,7 +148,6 @@ internal extension OKHTTPClient {
                 }
             }
 
-            // Correctly cancels the network request if the stream is abandoned
             continuation.onTermination = { _ in
                 task.cancel()
             }
@@ -141,8 +158,6 @@ internal extension OKHTTPClient {
 // MARK: - Combine API
 internal extension OKHTTPClient {
     
-    /// Bridges the AsyncThrowingStream directly to Combine.
-    /// Fixes the original bugs where the buffer was reset on every packet.
     func stream<T: Decodable>(
         request: URLRequest,
         with responseType: T.Type
