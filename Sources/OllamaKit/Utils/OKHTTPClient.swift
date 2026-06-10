@@ -26,40 +26,41 @@ internal extension OKHTTPClient {
     }
     
     func stream<T: Decodable>(request: URLRequest, with responseType: T.Type) -> AsyncThrowingStream<T, Error> {
-        let decoder = self.decoder // capture safely
-        return AsyncThrowingStream { continuation in
-            Task {
-                do {
-                    let (bytes, response) = try await URLSession.shared.bytes(for: request)
-                    try validate(response: response)
+    let decoder = self.decoder
+    return AsyncThrowingStream { continuation in
+        Task {
+            do {
+                let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                try validate(response: response)
 
-                    continuation.onTermination = { terminationState in
-                        if case .cancelled = terminationState {
-                            bytes.task.cancel()
-                        }
+                continuation.onTermination = { terminationState in
+                    if case .cancelled = terminationState {
+                        bytes.task.cancel()
                     }
-
-                    var buffer = Data()
-                    
-                    for try await byte in bytes {
-                        buffer.append(byte)
-                        
-                        while let chunk = self.extractNextJSON(from: &buffer) {
-                            do {
-                                let decodedObject = try decoder.decode(T.self, from: chunk)
-                                continuation.yield(decodedObject)
-                            } catch {
-                                // Skip malformed chunks instead of finishing immediately
-                                print("Decoding error: \(error)")
-                                continue
-                            }
-                        }
-                    }
-                    
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
                 }
+
+                var buffer = Data()
+
+                // Process bytes sequentially to avoid races
+                for try await byte in bytes {
+                    buffer.append(byte)
+
+                    // Extract and decode in a tight loop
+                    while let chunk = self.extractNextJSON(from: &buffer) {
+                        do {
+                            let decodedObject = try decoder.decode(T.self, from: chunk)
+                            continuation.yield(decodedObject)
+                        } catch {
+                            print("Decoding error: \(error)")
+                            // Skip bad chunks, don’t finish
+                            continue
+                        }
+                    }
+                }
+
+                continuation.finish()
+            } catch {
+                continuation.finish(throwing: error)
             }
         }
     }
