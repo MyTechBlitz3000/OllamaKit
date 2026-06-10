@@ -8,6 +8,19 @@
 import Combine
 import Foundation
 
+// Actor to safely manage buffer mutations
+actor BufferActor {
+    private var buffer = Data()
+    
+    func append(_ byte: UInt8) {
+        buffer.append(byte)
+    }
+    
+    func nextChunk(extractor: (inout Data) -> Data?) -> Data? {
+        return extractor(&buffer)
+    }
+}
+
 internal struct OKHTTPClient: Sendable {
     private let decoder: JSONDecoder = .default
     static let shared = OKHTTPClient()
@@ -26,41 +39,39 @@ internal extension OKHTTPClient {
     }
     
     func stream<T: Decodable>(request: URLRequest, with responseType: T.Type) -> AsyncThrowingStream<T, Error> {
-    let decoder = self.decoder
-    return AsyncThrowingStream { continuation in
-        Task {
-            do {
-                let (bytes, response) = try await URLSession.shared.bytes(for: request)
-                try validate(response: response)
+        let decoder = self.decoder
+        let bufferActor = BufferActor()
+        
+        return AsyncThrowingStream { continuation in
+            Task {
+                do {
+                    let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                    try validate(response: response)
 
-                continuation.onTermination = { terminationState in
-                    if case .cancelled = terminationState {
-                        bytes.task.cancel()
-                    }
-                }
-
-                var buffer = Data()
-
-                // Process bytes sequentially to avoid races
-                for try await byte in bytes {
-                    buffer.append(byte)
-
-                    // Extract and decode in a tight loop
-                    while let chunk = self.extractNextJSON(from: &buffer) {
-                        do {
-                            let decodedObject = try decoder.decode(T.self, from: chunk)
-                            continuation.yield(decodedObject)
-                        } catch {
-                            print("Decoding error: \(error)")
-                            // Skip bad chunks, don’t finish
-                            continue
+                    continuation.onTermination = { terminationState in
+                        if case .cancelled = terminationState {
+                            bytes.task.cancel()
                         }
                     }
-                }
 
-                continuation.finish()
-            } catch {
-                continuation.finish(throwing: error)
+                    for try await byte in bytes {
+                        await bufferActor.append(byte)
+                        
+                        while let chunk = await bufferActor.nextChunk(extractor: self.extractNextJSON) {
+                            do {
+                                let decodedObject = try decoder.decode(T.self, from: chunk)
+                                continuation.yield(decodedObject)
+                            } catch {
+                                print("Decoding error: \(error)")
+                                continue
+                            }
+                        }
+                    }
+                    
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
             }
         }
     }
@@ -95,14 +106,16 @@ internal extension OKHTTPClient {
         let task = session.dataTask(with: request)
         task.resume()
         
-        var buffer = Data()
+        let bufferActor = BufferActor()
         
         return delegate.publisher()
             .tryMap { newData -> [T] in
-                buffer.append(newData)
-                var decodedObjects: [T] = []
+                for byte in newData {
+                    await bufferActor.append(byte)
+                }
                 
-                while let chunk = self.extractNextJSON(from: &buffer) {
+                var decodedObjects: [T] = []
+                while let chunk = await bufferActor.nextChunk(extractor: self.extractNextJSON) {
                     do {
                         let decodedObject = try self.decoder.decode(T.self, from: chunk)
                         decodedObjects.append(decodedObject)
