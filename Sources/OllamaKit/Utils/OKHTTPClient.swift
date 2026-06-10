@@ -1,73 +1,85 @@
 //
 //  OKHTTPClient.swift
 //
-//
-//  Created by Kevin Hermawan on 08/06/24.
-//
 
-import Combine
 import Foundation
+import Combine
 
-// Actor to safely manage buffer mutations
+// MARK: - Buffer Actor (fully owns mutation)
 actor BufferActor {
     private var buffer = Data()
-    
+
     func append(_ byte: UInt8) {
         buffer.append(byte)
     }
-    
-    func nextChunk(extractor: (inout Data) -> Data?) -> Data? {
-        return extractor(&buffer)
+
+    func extractNextJSON(_ extractor: (inout Data) -> Data?) -> Data? {
+        extractor(&buffer)
     }
 }
 
+// MARK: - Client
 internal struct OKHTTPClient: Sendable {
-    private let decoder: JSONDecoder = .default
+    private let decoder = JSONDecoder()
     static let shared = OKHTTPClient()
 }
 
+// MARK: - Async/Await API
 internal extension OKHTTPClient {
-    func send(request: URLRequest) async throws -> Void {
+
+    func send(request: URLRequest) async throws {
         let (_, response) = try await URLSession.shared.data(for: request)
         try validate(response: response)
     }
-    
-    func send<T: Decodable>(request: URLRequest, with responseType: T.Type) async throws -> T {
+
+    func send<T: Decodable>(
+        request: URLRequest,
+        with responseType: T.Type
+    ) async throws -> T {
         let (data, response) = try await URLSession.shared.data(for: request)
         try validate(response: response)
         return try decoder.decode(T.self, from: data)
     }
-    
-    func stream<T: Decodable>(request: URLRequest, with responseType: T.Type) -> AsyncThrowingStream<T, Error> {
+
+    func stream<T: Decodable>(
+        request: URLRequest,
+        with responseType: T.Type
+    ) -> AsyncThrowingStream<T, Error> {
+
         let decoder = self.decoder
         let bufferActor = BufferActor()
-        
+
         return AsyncThrowingStream { continuation in
             Task {
                 do {
                     let (bytes, response) = try await URLSession.shared.bytes(for: request)
                     try validate(response: response)
 
-                    continuation.onTermination = { terminationState in
-                        if case .cancelled = terminationState {
+                    continuation.onTermination = { termination in
+                        if case .cancelled = termination {
                             bytes.task.cancel()
                         }
                     }
 
                     for try await byte in bytes {
                         await bufferActor.append(byte)
-                        
-                        while let chunk = await bufferActor.nextChunk(extractor: self.extractNextJSON) {
+
+                        // IMPORTANT: keep extracting until no progress
+                        while true {
+                            guard let chunk = await bufferActor.extractNextJSON(self.extractNextJSON) else {
+                                break
+                            }
+
                             do {
-                                let decodedObject = try decoder.decode(T.self, from: chunk)
-                                continuation.yield(decodedObject)
+                                let decoded = try decoder.decode(T.self, from: chunk)
+                                continuation.yield(decoded)
                             } catch {
-                                print("Decoding error: \(error)")
-                                continue
+                                // skip bad chunk but DO NOT kill stream
+                                print("Decoding error:", error)
                             }
                         }
                     }
-                    
+
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -77,9 +89,14 @@ internal extension OKHTTPClient {
     }
 }
 
+// MARK: - Combine API
 internal extension OKHTTPClient {
-    func send<T: Decodable>(request: URLRequest, with responseType: T.Type) -> AnyPublisher<T, Error> {
-        return URLSession.shared.dataTaskPublisher(for: request)
+
+    func send<T: Decodable>(
+        request: URLRequest,
+        with responseType: T.Type
+    ) -> AnyPublisher<T, Error> {
+        URLSession.shared.dataTaskPublisher(for: request)
             .tryMap { data, response in
                 try self.validate(response: response)
                 return data
@@ -88,9 +105,9 @@ internal extension OKHTTPClient {
             .receive(on: DispatchQueue.main)
             .eraseToAnyPublisher()
     }
-    
+
     func send(request: URLRequest) -> AnyPublisher<Void, Error> {
-        return URLSession.shared.dataTaskPublisher(for: request)
+        URLSession.shared.dataTaskPublisher(for: request)
             .tryMap { _, response in
                 try self.validate(response: response)
                 return ()
@@ -98,88 +115,114 @@ internal extension OKHTTPClient {
             .receive(on: DispatchQueue.main)
             .eraseToAnyPublisher()
     }
-    
-    func stream<T: Decodable>(request: URLRequest, with responseType: T.Type) -> AnyPublisher<T, Error> {
+
+    func stream<T: Decodable>(
+        request: URLRequest,
+        with responseType: T.Type
+    ) -> AnyPublisher<T, Error> {
+
         let delegate = StreamingDelegate()
-        let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: .main)
-        
+        let session = URLSession(configuration: .default,
+                                 delegate: delegate,
+                                 delegateQueue: .main)
+
         let task = session.dataTask(with: request)
         task.resume()
-        
+
         let bufferActor = BufferActor()
-        
+
         return delegate.publisher()
-            .tryMap { newData -> [T] in
-                for byte in newData {
-                    await bufferActor.append(byte)
-                }
-                
-                var decodedObjects: [T] = []
-                while let chunk = await bufferActor.nextChunk(extractor: self.extractNextJSON) {
-                    do {
-                        let decodedObject = try self.decoder.decode(T.self, from: chunk)
-                        decodedObjects.append(decodedObject)
-                    } catch {
-                        print("Decoding error: \(error)")
-                        continue
+            .flatMap { newData -> AnyPublisher<T, Error> in
+                Future { promise in
+                    Task {
+                        for byte in newData {
+                            await bufferActor.append(byte)
+                        }
+
+                        var results: [T] = []
+
+                        while true {
+                            guard let chunk = await bufferActor.extractNextJSON(self.extractNextJSON) else {
+                                break
+                            }
+
+                            do {
+                                let decoded = try self.decoder.decode(T.self, from: chunk)
+                                results.append(decoded)
+                            } catch {
+                                print("Decoding error:", error)
+                            }
+                        }
+
+                        promise(.success(results))
                     }
                 }
-                
-                return decodedObjects
-            }
-            .flatMap { decodedObjects -> AnyPublisher<T, Error> in
-                Publishers.Sequence(sequence: decodedObjects)
-                    .setFailureType(to: Error.self)
-                    .eraseToAnyPublisher()
+                .flatMap { items in
+                    Publishers.Sequence(sequence: items)
+                        .setFailureType(to: Error.self)
+                }
+                .eraseToAnyPublisher()
             }
             .eraseToAnyPublisher()
     }
 }
 
+// MARK: - Core helpers
 private extension OKHTTPClient {
+
     func validate(response: URLResponse) throws {
-        guard let httpResponse = response as? HTTPURLResponse,
-              (200...299).contains(httpResponse.statusCode) else {
+        guard let http = response as? HTTPURLResponse,
+              (200...299).contains(http.statusCode) else {
             throw URLError(.badServerResponse)
         }
     }
-    
+
     func extractNextJSON(from buffer: inout Data) -> Data? {
-        var isEscaped = false
-        var isWithinString = false
-        var nestingDepth = 0
-        var objectStartIndex = buffer.startIndex
-        
-        for (index, byte) in buffer.enumerated() {
-            let character = Character(UnicodeScalar(byte))
-            
-            if isEscaped {
-                isEscaped = false
-            } else if character == "\\" {
-                isEscaped = true
-            } else if character == "\"" {
-                isWithinString.toggle()
-            } else if !isWithinString {
-                switch character {
-                case "{":
-                    nestingDepth += 1
-                    if nestingDepth == 1 {
-                        objectStartIndex = index
-                    }
-                case "}":
-                    nestingDepth -= 1
-                    if nestingDepth == 0 {
-                        let range = objectStartIndex..<buffer.index(after: index)
-                        let jsonObject = buffer.subdata(in: range)
-                        buffer.removeSubrange(range)
-                        return jsonObject
-                    }
-                default:
-                    break
+        var escaped = false
+        var inString = false
+        var depth = 0
+        var start: Data.Index?
+
+        for idx in buffer.indices {
+            let byte = buffer[idx]
+            let char = Character(UnicodeScalar(byte))
+
+            if escaped {
+                escaped = false
+                continue
+            }
+
+            if char == "\\" {
+                escaped = true
+                continue
+            }
+
+            if char == "\"" {
+                inString.toggle()
+                continue
+            }
+
+            guard !inString else { continue }
+
+            if char == "{" {
+                depth += 1
+                if depth == 1 {
+                    start = idx
+                }
+            }
+
+            if char == "}" {
+                depth -= 1
+
+                if depth == 0, let startIndex = start {
+                    let range = startIndex...idx
+                    let chunk = buffer.subdata(in: range)
+                    buffer.removeSubrange(range)
+                    return chunk
                 }
             }
         }
-        
+
         return nil
     }
 }
