@@ -35,7 +35,6 @@ internal extension OKHTTPClient {
                     try validate(response: response)
 
                     continuation.onTermination = { terminationState in
-                        // Cancellation of our task should cancel the URLSessionDataTask
                         if case .cancelled = terminationState {
                             bytes.task.cancel()
                         }
@@ -51,12 +50,14 @@ internal extension OKHTTPClient {
                                 let decodedObject = try self.decoder.decode(T.self, from: chunk)
                                 continuation.yield(decodedObject)
                             } catch {
-                                continuation.finish(throwing: error)
-                                return
+                                // Skip malformed chunks instead of finishing immediately
+                                print("Decoding error: \(error)")
+                                continue
                             }
                         }
                     }
                     
+                    // End the continuation cleanly once buffer is exhausted
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -71,7 +72,6 @@ internal extension OKHTTPClient {
         return URLSession.shared.dataTaskPublisher(for: request)
             .tryMap { data, response in
                 try self.validate(response: response)
-                
                 return data
             }
             .decode(type: T.self, decoder: decoder)
@@ -83,7 +83,6 @@ internal extension OKHTTPClient {
         return URLSession.shared.dataTaskPublisher(for: request)
             .tryMap { _, response in
                 try self.validate(response: response)
-                
                 return ()
             }
             .receive(on: DispatchQueue.main)
@@ -105,8 +104,14 @@ internal extension OKHTTPClient {
                 var decodedObjects: [T] = []
                 
                 while let chunk = self.extractNextJSON(from: &buffer) {
-                    let decodedObject = try self.decoder.decode(T.self, from: chunk)
-                    decodedObjects.append(decodedObject)
+                    do {
+                        let decodedObject = try self.decoder.decode(T.self, from: chunk)
+                        decodedObjects.append(decodedObject)
+                    } catch {
+                        // Skip bad chunks instead of failing the whole stream
+                        print("Decoding error: \(error)")
+                        continue
+                    }
                 }
                 
                 return decodedObjects
@@ -122,7 +127,8 @@ internal extension OKHTTPClient {
 
 private extension OKHTTPClient {
     func validate(response: URLResponse) throws {
-        guard let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) else {
+        guard let httpResponse = response as? HTTPURLResponse,
+              (200...299).contains(httpResponse.statusCode) else {
             throw URLError(.badServerResponse)
         }
     }
@@ -155,7 +161,6 @@ private extension OKHTTPClient {
                         let range = objectStartIndex..<buffer.index(after: index)
                         let jsonObject = buffer.subdata(in: range)
                         buffer.removeSubrange(range)
-                        
                         return jsonObject
                     }
                 default:
