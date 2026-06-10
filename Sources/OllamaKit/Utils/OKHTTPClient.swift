@@ -8,7 +8,7 @@
 import Combine
 import Foundation
 
-internal struct OKHTTPClient {
+internal struct OKHTTPClient: Sendable {
     private let decoder: JSONDecoder = .default
     static let shared = OKHTTPClient()
 }
@@ -16,18 +16,17 @@ internal struct OKHTTPClient {
 internal extension OKHTTPClient {
     func send(request: URLRequest) async throws -> Void {
         let (_, response) = try await URLSession.shared.data(for: request)
-        
         try validate(response: response)
     }
     
     func send<T: Decodable>(request: URLRequest, with responseType: T.Type) async throws -> T {
         let (data, response) = try await URLSession.shared.data(for: request)
         try validate(response: response)
-        
         return try decoder.decode(T.self, from: data)
     }
     
     func stream<T: Decodable>(request: URLRequest, with responseType: T.Type) -> AsyncThrowingStream<T, Error> {
+        let decoder = self.decoder // capture safely
         return AsyncThrowingStream { continuation in
             Task {
                 do {
@@ -47,7 +46,7 @@ internal extension OKHTTPClient {
                         
                         while let chunk = self.extractNextJSON(from: &buffer) {
                             do {
-                                let decodedObject = try self.decoder.decode(T.self, from: chunk)
+                                let decodedObject = try decoder.decode(T.self, from: chunk)
                                 continuation.yield(decodedObject)
                             } catch {
                                 // Skip malformed chunks instead of finishing immediately
@@ -57,7 +56,6 @@ internal extension OKHTTPClient {
                         }
                     }
                     
-                    // End the continuation cleanly once buffer is exhausted
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -108,7 +106,6 @@ internal extension OKHTTPClient {
                         let decodedObject = try self.decoder.decode(T.self, from: chunk)
                         decodedObjects.append(decodedObject)
                     } catch {
-                        // Skip bad chunks instead of failing the whole stream
                         print("Decoding error: \(error)")
                         continue
                     }
